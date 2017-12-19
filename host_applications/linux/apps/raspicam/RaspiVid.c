@@ -143,7 +143,7 @@ typedef struct RASPIVID_STATE_S RASPIVID_STATE;
 typedef struct
 {
    FILE *file_handle;                   /// File handle to write buffer data to.
-   int file_non_blocking_handle;        /// Descriptor to write buffer data to (non_blocking).
+   FILE *file_nb_handle;                /// File handle to write buffer data to (non-blocking).
    RASPIVID_STATE *pstate;              /// pointer to our state in case required in callback
    int abort;                           /// Set to 1 in callback if an error occurs to attempt to abort the capture
    char *cb_buff;                       /// Circular buffer
@@ -185,7 +185,7 @@ struct RASPIVID_STATE_S
    int quantisationParameter;          /// Quantisation parameter - quality. Set bitrate 0 and set this for variable bitrate
    int bInlineHeaders;                  /// Insert inline headers to stream (SPS, PPS)
    char *filename;                     /// filename of output file
-   char *filename_non_blocking;        /// filename_non_blocking of output file
+   char *filename_nb;                  /// filename of output file (non-blocking)
    int verbose;                        /// !0 if want detailed run information
    int demoMode;                       /// Run app in demo mode
    int demoInterval;                   /// Interval between camera settings changes
@@ -622,10 +622,10 @@ static int parse_cmdline(int argc, const char **argv, RASPIVID_STATE *state)
          int len = strlen(argv[i + 1]);
          if (len)
          {
-            state->filename_non_blocking = malloc(len + 1);
-            vcos_assert(state->filename_non_blocking);
-            if (state->filename_non_blocking)
-               strncpy(state->filename_non_blocking, argv[i + 1], len+1);
+            state->filename_nb = malloc(len + 1);
+            vcos_assert(state->filename_nb);
+            if (state->filename_nb)
+               strncpy(state->filename_nb, argv[i + 1], len+1);
             i++;
          }
          else
@@ -1091,48 +1091,6 @@ static void camera_control_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
 }
 
 /**
- * Open a non-blocking file
- *
- * @param state Pointer to state
- */
-static int open_filename_non_blocking(char *filename) {
-    int readfd, writefd;
-    struct stat status;
-    
-    readfd = open(filename, O_RDONLY | O_NONBLOCK);
-    if(-1==readfd)
-    {
-        perror("ftee: readfd: open()");
-        exit(EXIT_FAILURE);
-    }
-
-    if(-1==fstat(readfd, &status))
-    {
-        perror("ftee: fstat");
-        close(readfd);
-        exit(EXIT_FAILURE);
-    }
-
-    if(!S_ISFIFO(status.st_mode))
-    {
-        printf("ftee: %s in not a fifo!\n", filename);
-        close(readfd);
-        exit(EXIT_FAILURE);
-    }
-
-    writefd = open(filename, O_WRONLY | O_NONBLOCK);
-    if(-1==writefd)
-    {
-        perror("ftee: writefd: open()");
-        close(readfd);
-        exit(EXIT_FAILURE);
-    }
-
-    close(readfd);
-    return writefd;
-}
-
-/**
  * Open a file based on the settings in state
  *
  * @param state Pointer to state
@@ -1468,16 +1426,14 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
                }
             }
 
-            int fdesc;
-            if (pData->pstate->filename_non_blocking &&
-                pData->pstate->filename_non_blocking[0] != '-')
+            if (pData->pstate->filename_nb && pData->pstate->filename_nb[0] != '-')
             {
-               fdesc = open_filename_non_blocking(pData->pstate->filename_non_blocking);
+               new_handle = open_filename(pData->pstate, pData->pstate->filename_nb);
 
-               if (fdesc)
+               if (new_handle)
                {
-                  close(pData->file_non_blocking_handle);
-                  pData->file_non_blocking_handle = fdesc;
+                  fclose(pData->file_nb_handle);
+                  pData->file_nb_handle = new_handle;
                }
             }
 
@@ -1522,7 +1478,7 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
             else
             {
                bytes_written = fwrite(buffer->data, 1, buffer->length, pData->file_handle);
-               write(pData->file_non_blocking_handle, buffer->data, buffer->length);
+               fwrite(buffer->data, 1, buffer->length, pData->file_nb_handle);
                if(pData->flush_buffers) {
                  fflush(pData->file_handle);
                }
@@ -2805,15 +2761,15 @@ int main(int argc, const char **argv)
             }
          }
 
-         state.callback_data.file_non_blocking_handle = 0;
+         state.callback_data.file_nb_handle = NULL;
                   
-         if (state.filename_non_blocking)
+         if (state.filename_nb)
          {
-            state.callback_data.file_non_blocking_handle =  open_filename_non_blocking(state.filename_non_blocking);
-            if (!state.callback_data.file_non_blocking_handle)
+            state.callback_data.file_nb_handle =  open_filename(&state, state.filename_nb);
+            if (!state.callback_data.file_nb_handle)
             {
                // Notify user, carry on but discarding encoded output buffers
-               vcos_log_error("%s: Error opening output file: %s\nNo output file will be generated\n", __func__, state.filename_non_blocking);
+               vcos_log_error("%s: Error opening output file: %s\nNo output file will be generated\n", __func__, state.filename_nb);
             }
          }
 
