@@ -67,6 +67,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include <sys/stat.h>
+#include <fcntl.h>
+
 #define VERSION_STRING "v1.3.12"
 
 #include "bcm_host.h"
@@ -140,6 +143,7 @@ typedef struct RASPIVID_STATE_S RASPIVID_STATE;
 typedef struct
 {
    FILE *file_handle;                   /// File handle to write buffer data to.
+   int file_non_blocking_handle;        /// Descriptor to write buffer data to (non_blocking).
    RASPIVID_STATE *pstate;              /// pointer to our state in case required in callback
    int abort;                           /// Set to 1 in callback if an error occurs to attempt to abort the capture
    char *cb_buff;                       /// Circular buffer
@@ -181,6 +185,7 @@ struct RASPIVID_STATE_S
    int quantisationParameter;          /// Quantisation parameter - quality. Set bitrate 0 and set this for variable bitrate
    int bInlineHeaders;                  /// Insert inline headers to stream (SPS, PPS)
    char *filename;                     /// filename of output file
+   char *filename_non_blocking;        /// filename_non_blocking of output file
    int verbose;                        /// !0 if want detailed run information
    int demoMode;                       /// Run app in demo mode
    int demoInterval;                   /// Interval between camera settings changes
@@ -323,6 +328,7 @@ static void display_valid_parameters(char *app_name);
 #define CommandRaw          32
 #define CommandRawFormat    33
 #define CommandNetListen    34
+#define CommandOutputNonBlocking 35
 
 static COMMAND_LIST cmdline_commands[] =
 {
@@ -334,6 +340,7 @@ static COMMAND_LIST cmdline_commands[] =
          "\t\t  Connect to a remote IPv4 host (e.g. tcp://192.168.1.2:1234, udp://192.168.1.2:1234)\n"
          "\t\t  To listen on a TCP port (IPv4) and wait for an incoming connection use -l\n"
          "\t\t  (e.g. raspivid -l -o tcp://0.0.0.0:3333 -> bind to all network interfaces, raspivid -l -o tcp://192.168.1.1:3333 -> bind to a certain local IPv4)", 1 },
+   { CommandOutputNonBlocking, "-output2", "o2",  "Output for non-blocking FIFO", 1 },
    { CommandVerbose,       "-verbose",    "v",  "Output verbose information during run", 0 },
    { CommandTimeout,       "-timeout",    "t",  "Time (in ms) to capture for. If not specified, set to 5s. Zero to disable", 1 },
    { CommandDemoMode,      "-demo",       "d",  "Run a demo mode (cycle through range of camera options, no capture)", 1},
@@ -603,6 +610,22 @@ static int parse_cmdline(int argc, const char **argv, RASPIVID_STATE *state)
             vcos_assert(state->filename);
             if (state->filename)
                strncpy(state->filename, argv[i + 1], len+1);
+            i++;
+         }
+         else
+            valid = 0;
+         break;
+      }
+
+      case CommandOutputNonBlocking:  // output filename
+      {
+         int len = strlen(argv[i + 1]);
+         if (len)
+         {
+            state->filename_non_blocking = malloc(len + 1);
+            vcos_assert(state->filename_non_blocking);
+            if (state->filename_non_blocking)
+               strncpy(state->filename_non_blocking, argv[i + 1], len+1);
             i++;
          }
          else
@@ -1067,6 +1090,47 @@ static void camera_control_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
    mmal_buffer_header_release(buffer);
 }
 
+/**
+ * Open a non-blocking file
+ *
+ * @param state Pointer to state
+ */
+static int open_filename_non_blocking(char *filename) {
+    int readfd, writefd;
+    struct stat status;
+    
+    readfd = open(filename, O_RDONLY | O_NONBLOCK);
+    if(-1==readfd)
+    {
+        perror("ftee: readfd: open()");
+        exit(EXIT_FAILURE);
+    }
+
+    if(-1==fstat(readfd, &status))
+    {
+        perror("ftee: fstat");
+        close(readfd);
+        exit(EXIT_FAILURE);
+    }
+
+    if(!S_ISFIFO(status.st_mode))
+    {
+        printf("ftee: %s in not a fifo!\n", filename);
+        close(readfd);
+        exit(EXIT_FAILURE);
+    }
+
+    writefd = open(filename, O_WRONLY | O_NONBLOCK);
+    if(-1==writefd)
+    {
+        perror("ftee: writefd: open()");
+        close(readfd);
+        exit(EXIT_FAILURE);
+    }
+
+    close(readfd);
+    return writefd;
+}
 
 /**
  * Open a file based on the settings in state
@@ -1404,6 +1468,19 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
                }
             }
 
+            int fdesc;
+            if (pData->pstate->filename_non_blocking &&
+                pData->pstate->filename_non_blocking[0] != '-')
+            {
+               fdesc = open_filename_non_blocking(pData->pstate->filename_non_blocking);
+
+               if (fdesc)
+               {
+                  close(pData->file_non_blocking_handle);
+                  pData->file_non_blocking_handle = fdesc;
+               }
+            }
+
             if (pData->pstate->imv_filename && pData->pstate->imv_filename[0] != '-')
             {
                new_handle = open_filename(pData->pstate, pData->pstate->imv_filename);
@@ -1445,8 +1522,11 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
             else
             {
                bytes_written = fwrite(buffer->data, 1, buffer->length, pData->file_handle);
-               if(pData->flush_buffers) fflush(pData->file_handle);
-
+               write(pData->file_non_blocking_handle, buffer->data, buffer->length);
+               if(pData->flush_buffers) {
+                 fflush(pData->file_handle);
+               }
+               
                if(pData->pstate->save_pts &&
                   (buffer->flags & MMAL_BUFFER_HEADER_FLAG_FRAME_END ||
                    buffer->flags == 0 ||
@@ -2722,6 +2802,18 @@ int main(int argc, const char **argv)
             {
                // Notify user, carry on but discarding encoded output buffers
                vcos_log_error("%s: Error opening output file: %s\nNo output file will be generated\n", __func__, state.filename);
+            }
+         }
+
+         state.callback_data.file_non_blocking_handle = 0;
+                  
+         if (state.filename_non_blocking)
+         {
+            state.callback_data.file_non_blocking_handle =  open_filename_non_blocking(state.filename_non_blocking);
+            if (!state.callback_data.file_non_blocking_handle)
+            {
+               // Notify user, carry on but discarding encoded output buffers
+               vcos_log_error("%s: Error opening output file: %s\nNo output file will be generated\n", __func__, state.filename_non_blocking);
             }
          }
 
