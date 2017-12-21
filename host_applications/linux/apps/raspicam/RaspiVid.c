@@ -1204,7 +1204,7 @@ static FILE *open_filename(RASPIVID_STATE *pState, char *filename)
          }
          else//if (pState->netListen)
          {
-            if(0 <= (sfd = socket(AF_INET, socktype | SOCK_NONBLOCK, 0)))
+            if(0 <= (sfd = socket(AF_INET, socktype, 0)))
             {
                fprintf(stderr, "Connecting to %s:%hu...", inet_ntoa(saddr.sin_addr), port);
 
@@ -1481,7 +1481,6 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
                fwrite(buffer->data, 1, buffer->length, pData->file_nb_handle);
                if(pData->flush_buffers) {
                  fflush(pData->file_handle);
-                 fflush(pData->file_nb_handle);
                }
                
                if(pData->pstate->save_pts &&
